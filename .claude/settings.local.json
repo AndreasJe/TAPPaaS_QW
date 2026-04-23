@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(bash \".claude/skills/bash-script-validator/scripts/validate.sh\" \"src/foundation/templates/windows-server/deploy-vms.sh\")"
+    ]
+  }
+}

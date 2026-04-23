@@ -11,9 +11,10 @@
 # License: MIT | https://github.com/community-scripts/ProxmoxVE/raw/main/LICENSE
 #
 
-# This script create a NixOS VM on Proxmox for TAPPaaS usage.
+# This script creates a VM on Proxmox for TAPPaaS usage.
+# Supports NixOS, Debian/Ubuntu and Windows Server VMs.
 #
-# Usage: bash TAPPaaS-NixOS-Cloning.sh name-of-VM  (name of VM will be used to reference the json config file in ~/tappaas/)
+# Usage: bash Create-TAPPaaS-VM.sh name-of-VM  (name of VM will be used to reference the json config file in ~/tappaas/)
 
 function error_handler() {
   local exit_code="$?"
@@ -292,19 +293,62 @@ if [ "$IMAGETYPE" == "img" ]; then  # First use: this is used to stand up a fire
   qm resize $VMID scsi0 $DISK_SIZE  >/dev/null
 fi
 
-if [ "$IMAGETYPE" == "iso" ]; then # First use: this is used to stand up a nixos template vm from an iso image
+if [ "$IMAGETYPE" == "iso" ]; then # First use: this is used to stand up a template vm from an iso image
   info "${BOLD}Creating an ISO based VM"
-  qm create $VMID --agent 1 --tablet 0 --localtime 1 --bios $BIOS \
-    --name $VMNAME --onboot 1 --ostype $VM_OSTYPE --cpu "$CPU_TYPE" --scsihw virtio-scsi-pci >/dev/null
-  info " - Created base VM configuration"
-  pvesm alloc $STORAGE $VMID $DISK0 4M  1>/dev/null
-  pvesm alloc $STORAGE $VMID $DISK1 $DISK_SIZE  1>/dev/null
-  info " - Created EFI disk"
-  qm set $VMID \
-    -ide3 local:iso/${IMAGE},media=cdrom\
-    -efidisk0 ${DISK0_REF} \
-    -scsi0 ${DISK1_REF},discard=on,ssd=1,size=${DISK_SIZE} \
-    -boot order='ide3;scsi0' >/dev/null
+
+  # Detect Windows OS types for special handling
+  IS_WINDOWS=false
+  case "$VM_OSTYPE" in
+    win10|win11|win2k19|win2k22|win2k25) IS_WINDOWS=true ;;
+  esac
+
+  if [ "$IS_WINDOWS" == "true" ]; then
+    # Windows VM: use q35 machine type, add TPM 2.0, mount VirtIO drivers ISO
+    info " - Windows OS detected ($VM_OSTYPE) — using q35 machine type with TPM"
+    qm create $VMID --agent 1 --tablet 1 --localtime 1 --bios $BIOS \
+      --machine q35 \
+      --name $VMNAME --onboot 1 --ostype $VM_OSTYPE --cpu "$CPU_TYPE" --scsihw virtio-scsi-pci >/dev/null
+    info " - Created base VM configuration (q35)"
+
+    pvesm alloc $STORAGE $VMID $DISK0 4M  1>/dev/null
+    pvesm alloc $STORAGE $VMID $DISK1 $DISK_SIZE  1>/dev/null
+    info " - Created EFI disk"
+
+    # Add TPM 2.0 (required for Windows Server 2025 / Windows 11)
+    qm set $VMID --tpmstate0 ${STORAGE}:1,version=v2.0 >/dev/null
+    info " - Added TPM 2.0"
+
+    # Mount Windows ISO as primary CD-ROM
+    qm set $VMID \
+      -ide2 local:iso/${IMAGE},media=cdrom \
+      -efidisk0 ${DISK0_REF} \
+      -scsi0 ${DISK1_REF},discard=on,ssd=1,size=${DISK_SIZE} \
+      -boot order='ide2;scsi0' >/dev/null
+
+    # Mount VirtIO drivers ISO as secondary CD-ROM (if available)
+    VIRTIO_ISO=$(ls /var/lib/vz/template/iso/virtio-win*.iso 2>/dev/null | sort -V | tail -1)
+    if [ -n "$VIRTIO_ISO" ]; then
+      VIRTIO_ISO_NAME=$(basename "$VIRTIO_ISO")
+      qm set $VMID -ide3 local:iso/${VIRTIO_ISO_NAME},media=cdrom >/dev/null
+      info " - Mounted VirtIO drivers ISO: ${VIRTIO_ISO_NAME}"
+    else
+      warn "VirtIO drivers ISO not found in /var/lib/vz/template/iso/ — Windows will need drivers during install"
+      warn "Download from: https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso"
+    fi
+  else
+    # Linux VM: standard setup
+    qm create $VMID --agent 1 --tablet 0 --localtime 1 --bios $BIOS \
+      --name $VMNAME --onboot 1 --ostype $VM_OSTYPE --cpu "$CPU_TYPE" --scsihw virtio-scsi-pci >/dev/null
+    info " - Created base VM configuration"
+    pvesm alloc $STORAGE $VMID $DISK0 4M  1>/dev/null
+    pvesm alloc $STORAGE $VMID $DISK1 $DISK_SIZE  1>/dev/null
+    info " - Created EFI disk"
+    qm set $VMID \
+      -ide3 local:iso/${IMAGE},media=cdrom\
+      -efidisk0 ${DISK0_REF} \
+      -scsi0 ${DISK1_REF},discard=on,ssd=1,size=${DISK_SIZE} \
+      -boot order='ide3;scsi0' >/dev/null
+  fi
 fi
 # qm resize $VMID scsi0 ${DISK_SIZE} >/dev/null
 
@@ -482,6 +526,23 @@ function resize_disk_in_vm() {
         warn "Unsupported filesystem $fstype, partition resized but filesystem not expanded"
         return 1
       fi
+      ;;
+        "")
+      # Empty os_id may indicate Windows (no /etc/os-release)
+      # Try Windows resize via guest agent
+      info "No Linux OS detected — attempting Windows disk extend via guest agent"
+      qm guest exec "$vmid" -- powershell -NoProfile -Command "
+        \$partition = Get-Partition -DriveLetter C -ErrorAction SilentlyContinue
+        if (\$partition) {
+          \$maxSize = (Get-PartitionSupportedSize -DriveLetter C).SizeMax
+          if (\$partition.Size -lt \$maxSize) {
+            Resize-Partition -DriveLetter C -Size \$maxSize
+            Write-Output 'Partition C: extended'
+          } else {
+            Write-Output 'Partition C: already at maximum size'
+          }
+        }
+      " &>/dev/null || true
       ;;
     *)
       warn "Unsupported OS '$os_id', skipping filesystem resize"

@@ -2,8 +2,9 @@
 #
 # TAPPaaS OS Update Script
 #
-# Updates a VM's operating system based on its type (NixOS or Debian/Ubuntu).
-# Handles IP detection, SSH setup, and OS-specific update procedures.
+# Updates a VM's operating system based on its type (NixOS, Debian/Ubuntu,
+# or Windows Server). Handles IP detection, SSH setup, and OS-specific
+# update procedures.
 #
 # Usage: update-os.sh <vmname> <vmid> <node>
 #
@@ -31,7 +32,7 @@ usage() {
     cat << EOF
 Usage: ${SCRIPT_NAME} <vmname> <vmid> <node>
 
-Update a VM's operating system based on its type (NixOS or Debian/Ubuntu).
+Update a VM's operating system based on its type (NixOS, Debian/Ubuntu, or Windows Server).
 
 Arguments:
     vmname  Name of the VM
@@ -42,11 +43,12 @@ Examples:
     ${SCRIPT_NAME} myvm 610 tappaas1
 
 The script will:
-  - Detect the VM's IP address (via guest agent or DHCP leases)
-  - Detect the OS type (NixOS or Debian/Ubuntu)
+    - Detect the VM's IP address (via guest agent or DHCP leases)
+  - Detect the OS type (NixOS, Debian/Ubuntu, or Windows Server)
   - For NixOS: Run nixos-rebuild using ./<vmname>.nix and reboot
   - For Debian/Ubuntu: Run apt update/upgrade
-  - Fix DHCP hostname registration
+  - For Windows: Security-only updates via PSWindowsUpdate
+  - Fix DHCP hostname registration (Linux only)
 EOF
 }
 
@@ -146,9 +148,15 @@ detect_os_type() {
         return 0
     fi
 
-    # Try to detect Debian/Ubuntu
+        # Try to detect Debian/Ubuntu
     if ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "tappaas@${ip}" "test -f /etc/debian_version" 2>/dev/null; then
         echo "debian"
+        return 0
+    fi
+
+    # Try to detect Windows (OpenSSH on Windows has cmd.exe)
+    if ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "tappaas@${ip}" "powershell -NoProfile -Command \"Write-Output ok\"" 2>/dev/null | grep -q "ok"; then
+        echo "windows"
         return 0
     fi
 
@@ -223,6 +231,70 @@ update_debian() {
     else
         ssh "tappaas@${vm_ip}" "sudo apt-get install -y qemu-guest-agent && sudo systemctl enable --now qemu-guest-agent" 2>&1 | while IFS= read -r _; do printf "."; done
         echo ""
+    fi
+}
+
+# Update Windows Server VM (security-only)
+update_windows() {
+    local vmname="$1"
+    local vmid="$2"
+    local node="$3"
+    local vm_ip="$4"
+
+    info "Running Windows security-only updates..."
+
+    # Temporarily enable Windows Update service
+    ssh -o ConnectTimeout=30 -o BatchMode=yes "tappaas@${vm_ip}" "powershell -NoProfile -NonInteractive -Command \"
+        Set-Service -Name wuauserv -StartupType Manual
+        Start-Service wuauserv
+    \"" || true
+
+    # Install security updates only via PSWindowsUpdate
+    local update_result
+    update_result=$(ssh -o ConnectTimeout=30 -o BatchMode=yes "tappaas@${vm_ip}" "powershell -NoProfile -NonInteractive -Command \"
+        Import-Module PSWindowsUpdate -ErrorAction SilentlyContinue
+
+        \\\$available = Get-WindowsUpdate -Category 'Security Updates' -IgnoreReboot -ErrorAction SilentlyContinue
+        if (\\\$available.Count -eq 0) {
+            Write-Output 'UPDATES:0|REBOOT:False'
+            exit 0
+        }
+
+        foreach (\\\$u in \\\$available) {
+            Write-Output \"  - \\\$(\\\$u.Title)\"
+        }
+
+        \\\$installed = Get-WindowsUpdate -Category 'Security Updates' -AcceptAll -Install -IgnoreReboot
+        \\\$rebootNeeded = (Get-WURebootStatus).RebootRequired
+        Write-Output \"UPDATES:\\\$(\\\$installed.Count)|REBOOT:\\\$rebootNeeded\"
+    \"" 2>/dev/null) || true
+
+    info "Update result: ${update_result}"
+
+    # Disable Windows Update service again
+    ssh -o ConnectTimeout=30 -o BatchMode=yes "tappaas@${vm_ip}" "powershell -NoProfile -NonInteractive -Command \"
+        Stop-Service wuauserv -Force -ErrorAction SilentlyContinue
+        Set-Service -Name wuauserv -StartupType Disabled
+    \"" || true
+
+    # Reboot only if Windows requires it
+    if [[ "${update_result}" == *"REBOOT:True"* ]]; then
+        info "Reboot required after security updates"
+        info "Rebooting VM..."
+        ssh "root@${node}.${MGMT}.internal" "qm reboot ${vmid}" || true
+        info "Waiting 120 seconds for VM to restart..."
+        sleep 120
+
+        # Wait for VM to come back
+        local new_ip
+        new_ip=$(wait_for_vm_ip "${node}" "${vmid}" 18) || die "Could not get VM IP address after Windows reboot"
+        info "VM IP address after reboot: ${new_ip}"
+        update_ssh_known_hosts "${new_ip}"
+        wait_for_ssh "${new_ip}" 300 || die "SSH not available on ${new_ip} after reboot"
+    elif [[ "${update_result}" == *"UPDATES:0"* ]]; then
+        info "No security updates available — system is up to date"
+    else
+        info "Updates installed — no reboot required"
     fi
 }
 
@@ -315,13 +387,16 @@ main() {
     os_type=$(detect_os_type "${vm_ip}")
     info "Detected OS: ${BL}${os_type}${CL}"
 
-    # Perform OS-specific update
+        # Perform OS-specific update
     case "${os_type}" in
         nixos)
             update_nixos "${vmname}" "${vmid}" "${node}" "${vm_ip}"
             ;;
         debian)
             update_debian "${vm_ip}"
+            ;;
+        windows)
+            update_windows "${vmname}" "${vmid}" "${node}" "${vm_ip}"
             ;;
         *)
             die "Unknown or unsupported OS type: ${os_type}"
@@ -336,8 +411,10 @@ main() {
         update_ssh_known_hosts "${vm_ip}"
     fi
 
-    # Fix DHCP hostname registration
-    fix_dhcp_hostname "${vmname}" "${vm_ip}"
+    # Fix DHCP hostname registration (Linux only)
+    if [[ "${os_type}" != "windows" ]]; then
+        fix_dhcp_hostname "${vmname}" "${vm_ip}"
+    fi
 
     echo ""
     info "${GN}=== OS update completed successfully ===${CL}"
